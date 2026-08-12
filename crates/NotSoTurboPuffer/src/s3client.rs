@@ -148,7 +148,7 @@ async fn create_metadata(namespace: &str) -> Result<()> {
         wal_files: Vec::new(),
         deleted_files: Vec::new(),
         unindexed_bytes: 0,
-        distance_metric: crate::engine::DistanceMetric::default(),
+        distance_metric: crate::vectors::DistanceMetric::default(),
         schema: crate::engine::Schema::default(),
         vector_dimensions: None,
     };
