@@ -13,10 +13,7 @@ use tokio::{
     sync::{Mutex, MutexGuard, OnceCell},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Namespace {
-    pub id: String,
-}
+use crate::engine::Namespace;
 
 #[derive(Debug, Default)]
 pub struct RoundTripCounter {
