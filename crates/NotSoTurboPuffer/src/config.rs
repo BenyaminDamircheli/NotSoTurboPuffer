@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow};
+use std::time::Duration;
 use tokio::{fs, sync::OnceCell};
 use toml::Table;
+
 
 #[derive(Debug)]
 pub struct Config {
@@ -32,7 +34,7 @@ pub struct LimitsConfig {
 
 #[derive(Debug)]
 pub struct BatchingConfig {
-    pub max_batch_time_ms: u64,
+    pub max_batch_time: Duration,
     pub max_batch_size: usize,
     pub max_batch_bytes: usize,
 }
@@ -143,11 +145,13 @@ pub async fn get_config() -> Result<&'static Config> {
                         .try_into()?,
                 },
                 batching: BatchingConfig {
-                    max_batch_time_ms: batching
-                        .get("max_batch_time_ms")
-                        .and_then(toml::Value::as_integer)
-                        .ok_or(anyhow!("bad max_batch_time_ms"))?
-                        .try_into()?,
+                    max_batch_time: Duration::from_millis(
+                        batching
+                            .get("max_batch_time_ms")
+                            .and_then(toml::Value::as_integer)
+                            .ok_or(anyhow!("bad max_batch_time_ms"))?
+                            .try_into()?,
+                    ),
                     max_batch_size: batching
                         .get("max_batch_size")
                         .and_then(toml::Value::as_integer)

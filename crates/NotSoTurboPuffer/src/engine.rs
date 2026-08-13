@@ -256,7 +256,7 @@ pub fn replay_wal_with_tombstones(
 
                     if !is_deleted {
                         if let Some((existing_row, existing_ts)) = state.get_mut(&document_id) {
-                            if ts > *existing_ts {
+                            if ts >= *existing_ts {
                                 for (k, v) in patch_attrs {
                                     existing_row.attributes.insert(k, v);
                                 }
@@ -274,4 +274,104 @@ pub fn replay_wal_with_tombstones(
         state.into_iter().map(|(id, (row, _))| (id, row)).collect(),
         deleted_ids,
     ))
+}
+
+/// Replays Write-Ahead Log chunks to build the final document state.
+///
+/// This function processes WAL chunks in order, applying upserts, patches, and deletes
+/// to reconstruct the current state of all documents. Operations are applied based on
+/// their timestamps - later operations override earlier ones for the same document.
+///
+/// - Upserts create or replace documents entirely
+/// - Patches modify attributes of existing documents (ignored if document was deleted)
+/// - Deletes remove documents from the final state
+/// - Operations with equal timestamps are processed in log order (later wins)
+/// - Missing or corrupt WAL data is treated as an error
+pub fn replay_wal(wal_chunks: &[Vec<u8>]) -> Result<HashMap<DocumentId, Row>> {
+    let (state, _) = replay_wal_with_tombstones(wal_chunks)?;
+    Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use rkyv::to_bytes;
+
+    use crate::vectors::distance;
+
+    use super::*;
+    // ... (existing tests)
+
+    #[test]
+    fn test_distance_euclidean_squared() {
+        let a = vec![1.0_f32, 2.0];
+        let b = vec![4.0_f32, 6.0];
+
+        let dist = distance(&a, &b, DistanceMetric::EuclideanSquared);
+        assert!((dist - 25.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_replay_wal_same_timestamp_collision() {
+        // Verifies that when timestamps are equal, the log order (later record) wins.
+
+        let id = DocumentId::from("collision_doc");
+        let ts = 100;
+
+        // 1. Upsert (Original)
+        let row1 = Row {
+            id: id.clone(),
+            vector: vec![1.0, 0.0, 0.0],
+            attributes: HashMap::new(),
+            timestamp: ts,
+        };
+        let op1 = WalRecord::Upsert(row1);
+
+        // 2. Patch (Same TS) -> Should apply
+        let mut patch_attrs = HashMap::new();
+        patch_attrs.insert("patched".to_string(), AttributeValue::Bool(true));
+        let op2 = WalRecord::Patch {
+            id: id.clone(),
+            attributes: patch_attrs,
+            timestamp: ts,
+        };
+
+        // 3. Delete (Same TS) -> Should delete
+        let op3 = WalRecord::Delete {
+            id: id.clone(),
+            timestamp: ts,
+        };
+
+        // 4. Upsert (Same TS) -> Should bring it back
+        let row2 = Row {
+            id: id.clone(),
+            vector: vec![0.0, 1.0, 0.0],
+            attributes: HashMap::new(),
+            timestamp: ts,
+        };
+        let op4 = WalRecord::Upsert(row2);
+
+        // Case A: Upsert -> Patch (Same TS). Expect: Patched.
+        let chunk_a = to_bytes::<rkyv::rancor::Error>(&vec![op1.clone(), op2])
+            .unwrap()
+            .to_vec();
+        let state_a = replay_wal(&[chunk_a]).unwrap();
+        assert!(state_a.contains_key(&id));
+        assert!(state_a[&id].attributes.contains_key("patched"));
+
+        // Case B: Upsert -> Delete (Same TS). Expect: Deleted.
+        let chunk_b = to_bytes::<rkyv::rancor::Error>(&vec![op1, op3.clone()])
+            .unwrap()
+            .to_vec();
+        let state_b = replay_wal(&[chunk_b]).unwrap();
+        assert!(state_b.is_empty());
+
+        // Case C: Delete -> Upsert (Same TS). Expect: Upserted.
+        // Note: This tests if strict `>` in is_deleted check allows same-ts upsert to proceed.
+        let chunk_c = to_bytes::<rkyv::rancor::Error>(&vec![op3, op4])
+            .unwrap()
+            .to_vec();
+        let state_c = replay_wal(&[chunk_c]).unwrap();
+        assert!(state_c.contains_key(&id));
+        assert!((state_c[&id].vector[1] - 1.0).abs() < 1e-6); // row2 vector
+    }
 }
