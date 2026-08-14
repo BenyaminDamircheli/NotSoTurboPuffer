@@ -4,4 +4,5 @@ pub mod engine;
 pub mod vectors;
 pub mod wal_batcher;
 pub mod inverted_index;
+pub mod ann;
 

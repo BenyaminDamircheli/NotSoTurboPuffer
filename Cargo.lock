@@ -1548,6 +1548,7 @@ dependencies = [
  "aws-sdk-s3",
  "chrono",
  "dotenvy",
+ "rand",
  "rkyv",
  "serde",
  "serde_json",
