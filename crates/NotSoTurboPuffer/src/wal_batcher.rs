@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::sync::{Mutex, OnceCell, RwLock, oneshot};
 
 use crate::config::get_config;
 use crate::engine::WalRecord;
@@ -40,6 +40,12 @@ pub struct WriteBatch {
     requests: Vec<WriteRequest>,
     created_at: Instant,
     bytes: usize,
+}
+
+impl Default for WriteBatch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WriteBatch {
@@ -118,7 +124,7 @@ impl WalBatcher {
     }
 
     async fn submit_write(&self, namespace: String, records: Vec<WalRecord>) {
-        let (response_tx, response_rx) = oneshot::channel();
+        let (response_tx, _) = oneshot::channel();
 
         let estimated_size = records.len() * 1024;
 
@@ -188,7 +194,7 @@ impl WalBatcher {
             if batch_guard.is_empty() {
                 return Ok(());
             }
-            std::mem::replace(&mut *batch_guard, WriteBatch::new())
+            std::mem::take(&mut *batch_guard)
         };
 
         let request_count = batch.requests.len();
@@ -213,7 +219,7 @@ impl WalBatcher {
             .with_context(|| format!("Failed to serialize batch for namespace: {namespace}"))?;
 
         let ulid = ulid::Ulid::from_bytes(bytes.as_slice().try_into().unwrap());
-        let wal_key = format!("wal/{}", ulid.to_string());
+        let wal_key = format!("wal/{ulid}");
 
         let s3_result = s3client::put_object_if_not_exists(namespace, &wal_key, &bytes).await;
 
@@ -228,7 +234,7 @@ impl WalBatcher {
                 );
 
                 for request in batch.requests {
-                    let _ = request.response_tx.send(Ok(()));
+                    let _ = request.response_tx.send(Ok(wal_key.clone()));
                 }
             }
             Err(e) => {
@@ -247,4 +253,44 @@ impl WalBatcher {
         }
         Ok(())
     }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(()).await;
+        }
+
+        Self::flush_ready_batches(
+            &self.batches,
+            &BatchConfig {
+                max_batch_time: Duration::ZERO,
+                ..self.config
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+}
+
+static WAL_BATCHER: OnceCell<Arc<Mutex<WalBatcher>>> = OnceCell::const_new();
+
+pub async fn get_wal_batcher() -> Result<Arc<Mutex<WalBatcher>>> {
+    WAL_BATCHER
+        .get_or_try_init(|| async {
+            let config = BatchConfig::from_system_config().await?;
+            let mut batcher = WalBatcher::new(config);
+            batcher.start().await?;
+            Ok(Arc::new(Mutex::new(batcher)))
+        })
+        .await
+        .cloned()
+}
+
+pub async fn submit_batched_write(namespace: &str, records: Vec<WalRecord>) -> Result<String> {
+    let batcher = get_wal_batcher().await?;
+    let batcher_guard = batcher.lock().await;
+    batcher_guard
+        .submit_write(namespace.to_string(), records)
+        .await;
+    Ok("".to_string())
 }
