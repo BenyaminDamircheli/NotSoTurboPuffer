@@ -9,11 +9,12 @@ aws-config = "1.10.1"
 aws-sdk-s3 = "1.140.0"
 chrono = "0.4.45"
 dotenvy = "0.15.7"
+moka = { version = "0.12.16", features = ["future"] }
 rand = "0.10.2"
 rkyv = { version = "0.8.18", features = ["uuid-1"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
 toml = "1.1.4"
 tracing = "0.1.44"
 ulid = "3.0.0"

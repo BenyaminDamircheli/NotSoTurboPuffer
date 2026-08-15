@@ -6,12 +6,18 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{AttributeValue, Row};
+use crate::engine::{AttributeValue, DocumentId, Row};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvertedIndex {
     /// Field -> Value (Stringified) -> List of `DocIDs`
-    pub index: HashMap<String, HashMap<String, Vec<String>>>,
+    pub index: HashMap<String, HashMap<String, Vec<DocumentId>>>,
+}
+
+impl Default for InvertedIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InvertedIndex {
@@ -35,10 +41,10 @@ impl InvertedIndex {
                 index
                     .index
                     .entry(key.clone())
-                    .or_insert_with(HashMap::new)
+                    .or_default()
                     .entry(value_key)
-                    .or_insert_with(Vec::new)
-                    .push(row.id.to_string());
+                    .or_default()
+                    .push(row.id.clone());
             }
         }
 
@@ -54,12 +60,12 @@ impl InvertedIndex {
 
     /// Returns the set of Document IDs that match ALL filters.
     /// Filters are Field -> Value.
-    pub fn filter(&self, filters: &HashMap<String, String>) -> Option<HashSet<String>> {
+    pub fn filter(&self, filters: &HashMap<String, String>) -> Option<HashSet<DocumentId>> {
         if filters.is_empty() {
             return None;
         }
 
-        let mut result_set: Option<HashSet<String>> = None;
+        let mut result_set: Option<HashSet<DocumentId>> = None;
 
         for (field, value) in filters {
             let Some(field_index) = self.index.get(field) else {
@@ -78,7 +84,7 @@ impl InvertedIndex {
                 Some(current_set) => {
                     // Intersection
                     // Efficient intersection: retain only those in `matches`
-                    let match_set: HashSet<&String> = matches.iter().collect();
+                    let match_set: HashSet<&DocumentId> = matches.iter().collect();
                     current_set.retain(|id| match_set.contains(id));
 
                     if current_set.is_empty() {
@@ -167,14 +173,14 @@ mod tests {
         filter.insert("tag".to_string(), "A".to_string());
         let results = index.filter(&filter).unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results.contains("doc1"));
-        assert!(results.contains("doc3"));
+        assert!(results.contains(&DocumentId::from("doc1")));
+        assert!(results.contains(&DocumentId::from("doc3")));
 
         // Test Filter: tag=A AND num=10
         filter.insert("num".to_string(), "10".to_string());
         let results = index.filter(&filter).unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results.contains("doc1"));
+        assert!(results.contains(&DocumentId::from("doc1")));
 
         // Test Filter: num=99 (No match)
         let mut filter_none = HashMap::new();

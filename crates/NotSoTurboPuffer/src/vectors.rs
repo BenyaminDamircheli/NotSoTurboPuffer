@@ -25,11 +25,6 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot
 }
 
-pub fn cosine_distance_iter(a: impl Iterator<Item = f32>, b: &[f32]) -> f32 {
-    let dot: f32 = a.zip(b).map(|(x, y)| x * y).sum();
-    1.0 - dot
-}
-
 pub fn euclidean_squared(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)

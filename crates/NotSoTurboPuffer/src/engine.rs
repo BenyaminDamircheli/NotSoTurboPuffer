@@ -6,7 +6,9 @@ use rkyv::{Archive, Deserialize, Serialize, access, deserialize, rancor::Failure
 
 use crate::vectors::DistanceMetric;
 
-#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Archive, Serialize, Deserialize, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[rkyv(derive(Hash, PartialEq, Eq))]
 #[repr(u8)]
 enum IdType {
     Uuid,
@@ -14,7 +16,9 @@ enum IdType {
     U64,
 }
 
-#[derive(Archive, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Archive, Serialize, Deserialize, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[rkyv(derive(Hash, PartialEq, Eq))]
 pub struct DocumentId {
     bytes: Vec<u8>,
     id_type: IdType,
@@ -181,6 +185,17 @@ pub enum IndexStatus {
     UpToDate,
 }
 
+/// The last-write-wins rule: an operation applies if nothing exists yet, or if
+/// its timestamp is at least as new as the existing one (ties go to log order).
+fn is_newer(existing_ts: Option<&i64>, ts: i64) -> bool {
+    existing_ts.is_none_or(|existing| ts >= *existing)
+}
+
+/// A document is dead for an operation only if a strictly newer delete exists.
+fn deleted_after(deleted_ids: &HashMap<DocumentId, i64>, id: &DocumentId, ts: i64) -> bool {
+    deleted_ids.get(id).is_some_and(|del_ts| *del_ts > ts)
+}
+
 pub fn replay_wal_with_tombstones(
     wal_chunks: &[Vec<u8>],
 ) -> Result<(HashMap<DocumentId, Row>, HashMap<DocumentId, i64>)> {
@@ -194,25 +209,14 @@ pub fn replay_wal_with_tombstones(
         for record in archived_records.iter() {
             match record {
                 rkyv::Archived::<WalRecord>::Upsert(row) => {
-                    let deserialized_row: Row = deserialize::<Row, rkyv::rancor::Error>(row)
+                    let row: Row = deserialize::<Row, rkyv::rancor::Error>(row)
                         .map_err(|e| anyhow::anyhow!("Failed to deserialize row: {}", e))?;
+                    let (id, ts) = (row.id.clone(), row.timestamp);
 
-                    let id = deserialized_row.id.clone();
-                    let ts = deserialized_row.timestamp;
-
-                    let is_deleted = deleted_ids
-                        .get(&id)
-                        .map(|del_ts| del_ts > &ts)
-                        .unwrap_or(false);
-
-                    if !is_deleted {
-                        if let Some((_, existing_ts)) = state.get(&id) {
-                            if ts >= *existing_ts {
-                                state.insert(id, (deserialized_row, ts));
-                            }
-                        } else {
-                            state.insert(id, (deserialized_row, ts));
-                        }
+                    if !deleted_after(&deleted_ids, &id, ts)
+                        && is_newer(state.get(&id).map(|(_, t)| t), ts)
+                    {
+                        state.insert(id, (row, ts));
                     }
                 }
                 rkyv::Archived::<WalRecord>::Delete { id, timestamp } => {
@@ -220,18 +224,11 @@ pub fn replay_wal_with_tombstones(
                         .map_err(|e| anyhow!("ID deserialization failed: {e}"))?;
                     let ts = timestamp.to_native();
 
-                    if let Some(existing_del_ts) = deleted_ids.get(&id) {
-                        if ts >= *existing_del_ts {
-                            deleted_ids.insert(id.clone(), ts);
-                        }
-                    } else {
+                    if is_newer(deleted_ids.get(&id), ts) {
                         deleted_ids.insert(id.clone(), ts);
                     }
-
-                    if let Some((_, row_ts)) = state.get(&id) {
-                        if ts >= *row_ts {
-                            state.remove(&id);
-                        }
+                    if state.get(&id).is_some_and(|(_, row_ts)| ts >= *row_ts) {
+                        state.remove(&id);
                     }
                 }
                 rkyv::Archived::<WalRecord>::Patch {
@@ -239,9 +236,8 @@ pub fn replay_wal_with_tombstones(
                     timestamp,
                     attributes,
                 } => {
-                    let document_id: DocumentId =
-                        deserialize::<DocumentId, rkyv::rancor::Error>(id)
-                            .map_err(|e| anyhow!("ID deserialization failed: {e}"))?;
+                    let id: DocumentId = deserialize::<DocumentId, rkyv::rancor::Error>(id)
+                        .map_err(|e| anyhow!("ID deserialization failed: {e}"))?;
                     let ts = timestamp.to_native();
                     let patch_attrs: HashMap<String, AttributeValue> =
                         deserialize::<HashMap<String, AttributeValue>, rkyv::rancor::Error>(
@@ -249,21 +245,15 @@ pub fn replay_wal_with_tombstones(
                         )
                         .map_err(|e| anyhow!("Attributes deserialization failed: {e}"))?;
 
-                    let is_deleted = deleted_ids
-                        .get(&document_id)
-                        .map(|&del_ts| del_ts > ts)
-                        .unwrap_or(false);
-
-                    if !is_deleted {
-                        if let Some((existing_row, existing_ts)) = state.get_mut(&document_id) {
-                            if ts >= *existing_ts {
-                                for (k, v) in patch_attrs {
-                                    existing_row.attributes.insert(k, v);
-                                }
-                                existing_row.timestamp = ts;
-                                *existing_ts = ts;
-                            }
-                        }
+                    if deleted_after(&deleted_ids, &id, ts) {
+                        continue;
+                    }
+                    if let Some((row, existing_ts)) = state.get_mut(&id)
+                        && ts >= *existing_ts
+                    {
+                        row.attributes.extend(patch_attrs);
+                        row.timestamp = ts;
+                        *existing_ts = ts;
                     }
                 }
             }
