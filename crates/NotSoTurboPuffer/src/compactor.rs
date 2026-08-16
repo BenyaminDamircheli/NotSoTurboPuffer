@@ -239,8 +239,6 @@ impl Compactor {
         Ok(())
     }
 
-    /// Compacts one batch of WAL files for the namespace. Returns `true` when
-    /// enough WAL files remain to justify another cycle.
     async fn compact_namespace(&self, namespace: &str, force: bool) -> Result<bool> {
         let Some(_guard) = self.try_begin(namespace) else {
             tracing::info!("Namespace {} already being compacted, skipping", namespace);
@@ -282,20 +280,63 @@ impl Compactor {
                 return Ok(false);
             }
 
-            let (state, _tombstones) = engine::replay_wal_with_tombstones(&chunks)?;
+            let engine::ReplayOutcome {
+                mut state,
+                deleted_ids: tombstones,
+                pending_patches,
+            } = engine::replay_wal_full(&chunks)?;
             tracing::info!(
-                "Replayed {} WAL files into {} unique documents for {}",
+                "Replayed {} WAL files into {} unique documents ({} tombstones, {} pending patches) for {}",
                 compacted_keys.len(),
                 state.len(),
+                tombstones.len(),
+                pending_patches.len(),
                 namespace
             );
 
+            // Pending patches target rows that live in the ANN index. Resolve
+            // them into full rows now so both indexes fold them in; otherwise
+            // the patches vanish with the compacted WAL files.
+            if !pending_patches.is_empty()
+                && let Some(mut index) = load_ann_index(namespace, &metadata).await?
+            {
+                if index.doc_to_posting.is_empty() && !index.posting_files.is_empty() {
+                    index.rebuild_doc_mapping().await?;
+                }
+                for (id, patch) in pending_patches {
+                    if let Some(mut row) = index.get_row(&id).await?
+                        && patch.timestamp >= row.timestamp
+                    {
+                        row.attributes.extend(patch.attributes);
+                        row.timestamp = patch.timestamp;
+                        state.insert(id, row);
+                    }
+                }
+            }
+
+            // Every document this batch touched: surviving rows plus deleted
+            // ones. Both indexes must apply deletions here — the tombstones
+            // vanish with the compacted WAL files, so a deleted document that
+            // stays in an index resurrects.
+            let touched: HashSet<engine::DocumentId> = state
+                .keys()
+                .chain(tombstones.keys())
+                .cloned()
+                .collect();
+            let deleted_ids: Vec<engine::DocumentId> = tombstones
+                .keys()
+                .filter(|id| !state.contains_key(*id))
+                .cloned()
+                .collect();
+
             let rows: Vec<Row> = state.values().cloned().collect();
-            let (ann_index_key, inverted_index_key) = if rows.is_empty() {
+            let (ann_result, inverted_index_key) = if touched.is_empty() {
                 (None, None)
             } else {
-                let inverted = upload_inverted_index(namespace, &rows, &metadata).await?;
-                let ann = update_spfresh_index(namespace, rows, &metadata, force).await?;
+                let inverted =
+                    update_inverted_index(namespace, &rows, &touched, &metadata).await?;
+                let ann =
+                    update_spfresh_index(namespace, rows, &deleted_ids, &metadata, force).await?;
                 (ann, Some(inverted))
             };
 
@@ -310,11 +351,11 @@ impl Compactor {
                 updated.unindexed_bytes = 0;
             }
 
-            if let Some(key) = ann_index_key {
+            if let Some((key, indexed_rows)) = ann_result {
                 if let Some(old) = updated.index.ann_index_file.replace(key) {
                     updated.deleted_files.push(old);
                 }
-                updated.index.indexed_row_count = state.len() as u64;
+                updated.index.indexed_row_count = indexed_rows;
             }
             if let Some(key) = inverted_index_key
                 && let Some(old) = updated.index.inverted_index_file.replace(key)
@@ -489,38 +530,53 @@ async fn download_wal_batch(
     Ok((chunks, compacted_keys, total_bytes))
 }
 
-/// Folds the replayed rows into the SPFresh index: incremental insert when a
-/// compatible index exists, full build otherwise. Returns the new index key,
-/// or `None` when the data is still too small to justify an index.
+/// Loads the namespace's persisted SPFresh index, or `None` when no index
+/// exists or the index file is unreadable.
+async fn load_ann_index(
+    namespace: &str,
+    metadata: &Metadata,
+) -> Result<Option<spfresh::SPFreshIndex>> {
+    let Some(file) = &metadata.index.ann_index_file else {
+        return Ok(None);
+    };
+    Ok(s3client::get_file(namespace, file)
+        .await?
+        .and_then(|data| spfresh::SPFreshIndex::from_rkyv_bytes(&data, namespace.to_string()).ok()))
+}
+
+/// Folds the batch into the SPFresh index: applies deletions first, then
+/// incremental inserts when a compatible index exists, or a full build
+/// otherwise. Returns the new index key and its total document count, or
+/// `None` when the data is still too small to justify an index.
 async fn update_spfresh_index(
     namespace: &str,
     rows: Vec<Row>,
+    deleted_ids: &[engine::DocumentId],
     metadata: &Metadata,
     force: bool,
-) -> Result<Option<String>> {
-    let existing = match &metadata.index.ann_index_file {
-        Some(file) => match s3client::get_file(namespace, file).await? {
-            Some(data) => spfresh::SPFreshIndex::from_rkyv_bytes(&data, namespace.to_string()).ok(),
-            None => None,
-        },
-        None => None,
-    };
+) -> Result<Option<(String, u64)>> {
+    let existing = load_ann_index(namespace, metadata).await?;
+    let new_dimensions = rows.first().map(|row| row.vector.len());
 
-    let dimensions = rows[0].vector.len();
     let mut index = match existing {
-        Some(mut index) if index.dimensions == dimensions => {
+        Some(mut index) if new_dimensions.is_none_or(|dims| dims == index.dimensions) => {
             if index.doc_to_posting.is_empty() && !index.posting_files.is_empty() {
                 index.rebuild_doc_mapping().await?;
+            }
+            // Deletions first: a tombstone in this batch is strictly older
+            // than any surviving row for the same document.
+            for doc_id in deleted_ids {
+                index.delete_vector(doc_id).await?;
             }
             index.insert_vectors(rows).await?;
             index
         }
         Some(index) => {
             tracing::warn!(
-                "Dimension mismatch in SPFresh index for {}: existing={}, new={}. Rebuilding.",
+                "Dimension mismatch in SPFresh index for {}: existing={}, new={:?}. Rebuilding.",
                 namespace,
                 index.dimensions,
-                dimensions
+                new_dimensions
             );
             spfresh::SPFreshIndex::build_from_rows(
                 rows,
@@ -531,7 +587,8 @@ async fn update_spfresh_index(
             .await?
         }
         None => {
-            if rows.len() < 10 && !force {
+            // Nothing indexed yet, so deletions are no-ops.
+            if rows.is_empty() || (rows.len() < 10 && !force) {
                 return Ok(None); // Too few rows to justify an index yet
             }
             spfresh::SPFreshIndex::build_from_rows(
@@ -556,20 +613,41 @@ async fn update_spfresh_index(
         index.posting_files.len(),
         index.vector_count()
     );
-    Ok(Some(key))
+    Ok(Some((key, index.vector_count() as u64)))
 }
 
-async fn upload_inverted_index(
+/// Folds the batch into the inverted index: loads the previous index, removes
+/// every touched document (updated or deleted), then re-inserts the surviving
+/// rows. Documents from earlier compactions keep their entries.
+async fn update_inverted_index(
     namespace: &str,
     rows: &[Row],
+    touched: &HashSet<engine::DocumentId>,
     metadata: &Metadata,
 ) -> Result<String> {
-    let index = InvertedIndex::build_from_rows(rows, &metadata.schema.index_attributes);
+    let mut index = match &metadata.index.inverted_index_file {
+        Some(file) => match s3client::get_file(namespace, file).await? {
+            Some(data) => serde_json::from_slice(&data).unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Existing inverted index for {} is unreadable ({}); rebuilding from this batch",
+                    namespace,
+                    e
+                );
+                InvertedIndex::new()
+            }),
+            None => InvertedIndex::new(),
+        },
+        None => InvertedIndex::new(),
+    };
+
+    index.remove_documents(touched);
+    index.insert_rows(rows, &metadata.schema.index_attributes);
+
     let bytes = serde_json::to_vec(&index)?;
     let key = format!("index/inverted_{}", ulid::Ulid::generate());
     s3client::put_object(namespace, &key, &bytes).await?;
 
-    tracing::info!("Uploaded inverted index {} ({} bytes)", key, bytes.len());
+    tracing::info!("Updated inverted index {} ({} bytes)", key, bytes.len());
     Ok(key)
 }
 

@@ -185,22 +185,34 @@ pub enum IndexStatus {
     UpToDate,
 }
 
-/// The last-write-wins rule: an operation applies if nothing exists yet, or if
-/// its timestamp is at least as new as the existing one (ties go to log order).
 fn is_newer(existing_ts: Option<&i64>, ts: i64) -> bool {
     existing_ts.is_none_or(|existing| ts >= *existing)
 }
 
-/// A document is dead for an operation only if a strictly newer delete exists.
 fn deleted_after(deleted_ids: &HashMap<DocumentId, i64>, id: &DocumentId, ts: i64) -> bool {
     deleted_ids.get(id).is_some_and(|del_ts| *del_ts > ts)
 }
 
-pub fn replay_wal_with_tombstones(
-    wal_chunks: &[Vec<u8>],
-) -> Result<(HashMap<DocumentId, Row>, HashMap<DocumentId, i64>)> {
+/// A patch whose target document is not in the replayed WAL state — the row
+/// it modifies lives in the ANN index. The query path overlays these on index
+/// results; compaction folds them into the indexes.
+#[derive(Debug, Clone)]
+pub struct PendingPatch {
+    pub attributes: HashMap<String, AttributeValue>,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Default)]
+pub struct ReplayOutcome {
+    pub state: HashMap<DocumentId, Row>,
+    pub deleted_ids: HashMap<DocumentId, i64>,
+    pub pending_patches: HashMap<DocumentId, PendingPatch>,
+}
+
+pub fn replay_wal_full(wal_chunks: &[Vec<u8>]) -> Result<ReplayOutcome> {
     let mut state: HashMap<DocumentId, (Row, i64)> = HashMap::new();
     let mut deleted_ids: HashMap<DocumentId, i64> = HashMap::new();
+    let mut pending_patches: HashMap<DocumentId, PendingPatch> = HashMap::new();
 
     for chunk in wal_chunks {
         let archived_records = access::<rkyv::Archived<Vec<WalRecord>>, Failure>(chunk)
@@ -230,6 +242,12 @@ pub fn replay_wal_with_tombstones(
                     if state.get(&id).is_some_and(|(_, row_ts)| ts >= *row_ts) {
                         state.remove(&id);
                     }
+                    if pending_patches
+                        .get(&id)
+                        .is_some_and(|patch| ts >= patch.timestamp)
+                    {
+                        pending_patches.remove(&id);
+                    }
                 }
                 rkyv::Archived::<WalRecord>::Patch {
                     id,
@@ -248,22 +266,63 @@ pub fn replay_wal_with_tombstones(
                     if deleted_after(&deleted_ids, &id, ts) {
                         continue;
                     }
-                    if let Some((row, existing_ts)) = state.get_mut(&id)
-                        && ts >= *existing_ts
-                    {
-                        row.attributes.extend(patch_attrs);
-                        row.timestamp = ts;
-                        *existing_ts = ts;
+                    if let Some((row, existing_ts)) = state.get_mut(&id) {
+                        if ts >= *existing_ts {
+                            row.attributes.extend(patch_attrs);
+                            row.timestamp = ts;
+                            *existing_ts = ts;
+                        }
+                    } else {
+                        // The target row is not in the WAL; keep the patch
+                        // pending so it can overlay the indexed row.
+                        match pending_patches.get_mut(&id) {
+                            Some(pending) if ts >= pending.timestamp => {
+                                pending.attributes.extend(patch_attrs);
+                                pending.timestamp = ts;
+                            }
+                            Some(_) => {}
+                            None => {
+                                pending_patches.insert(
+                                    id,
+                                    PendingPatch {
+                                        attributes: patch_attrs,
+                                        timestamp: ts,
+                                    },
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    Ok((
-        state.into_iter().map(|(id, (row, _))| (id, row)).collect(),
+    // A patch can precede the upsert of its target in the log; resolve those
+    // against the final state. Whatever stays pending targets indexed rows.
+    pending_patches.retain(|id, patch| {
+        let Some((row, existing_ts)) = state.get_mut(id) else {
+            return true;
+        };
+        if patch.timestamp >= *existing_ts {
+            row.attributes.extend(patch.attributes.clone());
+            row.timestamp = patch.timestamp;
+            *existing_ts = patch.timestamp;
+        }
+        false
+    });
+
+    Ok(ReplayOutcome {
+        state: state.into_iter().map(|(id, (row, _))| (id, row)).collect(),
         deleted_ids,
-    ))
+        pending_patches,
+    })
+}
+
+pub fn replay_wal_with_tombstones(
+    wal_chunks: &[Vec<u8>],
+) -> Result<(HashMap<DocumentId, Row>, HashMap<DocumentId, i64>)> {
+    let outcome = replay_wal_full(wal_chunks)?;
+    Ok((outcome.state, outcome.deleted_ids))
 }
 
 /// Replays Write-Ahead Log chunks to build the final document state.
@@ -298,6 +357,55 @@ mod tests {
 
         let dist = distance(&a, &b, DistanceMetric::EuclideanSquared);
         assert!((dist - 25.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_replay_patch_on_absent_doc() {
+        let id = DocumentId::from("indexed_doc");
+        let mut attrs = HashMap::new();
+        attrs.insert("k".to_string(), AttributeValue::Int(1));
+
+        // Case A: patch with no matching row stays pending for the index.
+        let patch = WalRecord::Patch {
+            id: id.clone(),
+            timestamp: 200,
+            attributes: attrs.clone(),
+        };
+        let chunk = to_bytes::<rkyv::rancor::Error>(&vec![patch.clone()])
+            .unwrap()
+            .to_vec();
+        let outcome = replay_wal_full(&[chunk]).unwrap();
+        assert!(outcome.state.is_empty());
+        assert_eq!(outcome.pending_patches[&id].timestamp, 200);
+
+        // Case B: a newer delete cancels the pending patch.
+        let delete = WalRecord::Delete {
+            id: id.clone(),
+            timestamp: 300,
+        };
+        let chunk = to_bytes::<rkyv::rancor::Error>(&vec![patch.clone(), delete])
+            .unwrap()
+            .to_vec();
+        let outcome = replay_wal_full(&[chunk]).unwrap();
+        assert!(outcome.pending_patches.is_empty());
+        assert!(outcome.deleted_ids.contains_key(&id));
+
+        // Case C: a patch that precedes its upsert in the log resolves
+        // against the final state when the patch timestamp is newer.
+        let upsert = WalRecord::Upsert(Row {
+            id: id.clone(),
+            vector: vec![1.0],
+            attributes: HashMap::new(),
+            timestamp: 100,
+        });
+        let chunk = to_bytes::<rkyv::rancor::Error>(&vec![patch, upsert])
+            .unwrap()
+            .to_vec();
+        let outcome = replay_wal_full(&[chunk]).unwrap();
+        assert!(outcome.pending_patches.is_empty());
+        let row = &outcome.state[&id];
+        assert_eq!(row.timestamp, 200);
+        assert!(matches!(row.attributes["k"], AttributeValue::Int(1)));
     }
 
     #[test]

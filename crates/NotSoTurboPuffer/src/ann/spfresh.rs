@@ -422,6 +422,18 @@ impl SPFreshIndex {
         Ok(())
     }
 
+    /// Fetches one indexed row by document id, or `None` when the document
+    /// is not in the index.
+    pub async fn get_row(&mut self, doc_id: &DocumentId) -> Result<Option<Row>> {
+        let Some(&posting_id) = self.doc_to_posting.get(doc_id) else {
+            return Ok(None);
+        };
+        Ok(self
+            .load_posting(posting_id)
+            .await?
+            .and_then(|posting| posting.rows.into_iter().find(|row| row.id == *doc_id)))
+    }
+
     /// Rebuilds `doc_to_posting` from the postings in storage.
     pub async fn rebuild_doc_mapping(&mut self) -> Result<()> {
         self.doc_to_posting.clear();

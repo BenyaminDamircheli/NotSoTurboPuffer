@@ -29,6 +29,13 @@ impl InvertedIndex {
 
     pub fn build_from_rows(rows: &[Row], attributes: &HashSet<String>) -> Self {
         let mut index = Self::new();
+        index.insert_rows(rows, attributes);
+        index
+    }
+
+    /// Inserts entries for the rows. An empty `attributes` set indexes every
+    /// attribute. Posting lists stay sorted and deduplicated.
+    pub fn insert_rows(&mut self, rows: &[Row], attributes: &HashSet<String>) {
         let index_all = attributes.is_empty();
 
         for row in rows {
@@ -38,8 +45,7 @@ impl InvertedIndex {
                 }
 
                 let value_key = Self::canonicalize_value(value);
-                index
-                    .index
+                self.index
                     .entry(key.clone())
                     .or_default()
                     .entry(value_key)
@@ -49,13 +55,30 @@ impl InvertedIndex {
         }
 
         // Sort for deterministic output / potentially faster intersection (if we used sorted arrays)
-        for field_map in index.index.values_mut() {
+        for field_map in self.index.values_mut() {
             for doc_list in field_map.values_mut() {
                 doc_list.sort();
+                doc_list.dedup();
             }
         }
+    }
 
-        index
+    /// Removes the documents from every posting list. Callers apply a
+    /// compaction batch as remove-then-insert: remove every touched document
+    /// (updated or deleted), then insert the surviving rows. Documents from
+    /// earlier compactions keep their entries.
+    pub fn remove_documents(&mut self, ids: &HashSet<DocumentId>) {
+        if ids.is_empty() {
+            return;
+        }
+
+        for field_map in self.index.values_mut() {
+            for doc_list in field_map.values_mut() {
+                doc_list.retain(|id| !ids.contains(id));
+            }
+            field_map.retain(|_, doc_list| !doc_list.is_empty());
+        }
+        self.index.retain(|_, field_map| !field_map.is_empty());
     }
 
     /// Returns the set of Document IDs that match ALL filters.
@@ -187,5 +210,54 @@ mod tests {
         filter_none.insert("num".to_string(), "99".to_string());
         let results = index.filter(&filter_none).unwrap();
         assert!(results.is_empty());
+    }
+
+    fn row(id: &str, tag: &str) -> Row {
+        let mut attrs = HashMap::new();
+        attrs.insert("tag".to_string(), AttributeValue::String(tag.to_string()));
+        Row {
+            id: DocumentId::from(id),
+            vector: vec![],
+            attributes: attrs,
+            timestamp: 0,
+        }
+    }
+
+    fn filter_ids(index: &InvertedIndex, field: &str, value: &str) -> HashSet<DocumentId> {
+        let mut filter = HashMap::new();
+        filter.insert(field.to_string(), value.to_string());
+        index.filter(&filter).unwrap()
+    }
+
+    #[test]
+    fn test_compaction_batch_merge_keeps_untouched_documents() {
+        // Cycle 1: index doc1 (tag=A) and doc2 (tag=B).
+        let mut index =
+            InvertedIndex::build_from_rows(&[row("doc1", "A"), row("doc2", "B")], &HashSet::new());
+
+        // Cycle 2: doc2 updates to tag=A, doc3 arrives (tag=B), doc1 untouched.
+        let batch = [row("doc2", "A"), row("doc3", "B")];
+        let touched: HashSet<DocumentId> = batch.iter().map(|r| r.id.clone()).collect();
+        index.remove_documents(&touched);
+        index.insert_rows(&batch, &HashSet::new());
+
+        // doc1 keeps its entry from cycle 1; doc2 moved from B to A.
+        let tag_a = filter_ids(&index, "tag", "A");
+        assert_eq!(tag_a.len(), 2);
+        assert!(tag_a.contains(&DocumentId::from("doc1")));
+        assert!(tag_a.contains(&DocumentId::from("doc2")));
+
+        let tag_b = filter_ids(&index, "tag", "B");
+        assert_eq!(tag_b.len(), 1);
+        assert!(tag_b.contains(&DocumentId::from("doc3")));
+
+        // Cycle 3: doc1 deleted (tombstone only, no surviving row).
+        let deleted: HashSet<DocumentId> = [DocumentId::from("doc1")].into();
+        index.remove_documents(&deleted);
+        index.insert_rows(&[], &HashSet::new());
+
+        let tag_a = filter_ids(&index, "tag", "A");
+        assert_eq!(tag_a.len(), 1);
+        assert!(tag_a.contains(&DocumentId::from("doc2")));
     }
 }

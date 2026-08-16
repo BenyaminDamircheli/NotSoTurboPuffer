@@ -68,6 +68,11 @@ pub trait ObjectStore: Send + Sync {
 
 pub struct S3Store {
     client: aws_sdk_s3::Client,
+    /// When set, all namespaces share this one physical bucket and the
+    /// namespace becomes a key prefix. Required for providers that scope
+    /// credentials to a single bucket (for example, Railway buckets).
+    /// When unset, each namespace is its own bucket.
+    fixed_bucket: Option<String>,
 }
 
 impl S3Store {
@@ -93,7 +98,16 @@ impl S3Store {
 
         Ok(Self {
             client: aws_sdk_s3::Client::new(&aws_config),
+            fixed_bucket: config.storage.s3_bucket.clone(),
         })
+    }
+
+    /// Resolves a (namespace, key) pair to the physical (bucket, object key).
+    fn location(&self, namespace: &str, key: &str) -> (String, String) {
+        match &self.fixed_bucket {
+            Some(bucket) => (bucket.clone(), format!("{namespace}/{key}")),
+            None => (namespace.to_string(), key.to_string()),
+        }
     }
 }
 
@@ -130,11 +144,12 @@ fn s3_error<E: ProvideErrorMetadata + fmt::Debug>(
 
 impl ObjectStore for S3Store {
     async fn get(&self, namespace: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let (bucket, object_key) = self.location(namespace, key);
         match self
             .client
             .get_object()
-            .bucket(namespace)
-            .key(key)
+            .bucket(bucket)
+            .key(object_key)
             .send()
             .await
         {
@@ -145,11 +160,12 @@ impl ObjectStore for S3Store {
     }
 
     async fn get_with_etag(&self, namespace: &str, key: &str) -> Result<Option<(Vec<u8>, String)>> {
+        let (bucket, object_key) = self.location(namespace, key);
         match self
             .client
             .get_object()
-            .bucket(namespace)
-            .key(key)
+            .bucket(bucket)
+            .key(object_key)
             .send()
             .await
         {
@@ -164,10 +180,11 @@ impl ObjectStore for S3Store {
     }
 
     async fn put(&self, namespace: &str, key: &str, data: &[u8]) -> Result<()> {
+        let (bucket, object_key) = self.location(namespace, key);
         self.client
             .put_object()
-            .bucket(namespace)
-            .key(key)
+            .bucket(bucket)
+            .key(object_key)
             .body(ByteStream::from(data.to_vec()))
             .send()
             .await
@@ -176,10 +193,11 @@ impl ObjectStore for S3Store {
     }
 
     async fn put_if_not_exists(&self, namespace: &str, key: &str, data: &[u8]) -> Result<()> {
+        let (bucket, object_key) = self.location(namespace, key);
         self.client
             .put_object()
-            .bucket(namespace)
-            .key(key)
+            .bucket(bucket)
+            .key(object_key)
             .if_none_match("*")
             .body(ByteStream::from(data.to_vec()))
             .send()
@@ -195,11 +213,12 @@ impl ObjectStore for S3Store {
         data: &[u8],
         etag: &str,
     ) -> Result<String> {
+        let (bucket, object_key) = self.location(namespace, key);
         let output = self
             .client
             .put_object()
-            .bucket(namespace)
-            .key(key)
+            .bucket(bucket)
+            .key(object_key)
             .if_match(etag)
             .body(ByteStream::from(data.to_vec()))
             .send()
@@ -209,10 +228,11 @@ impl ObjectStore for S3Store {
     }
 
     async fn delete(&self, namespace: &str, key: &str) -> Result<()> {
+        let (bucket, object_key) = self.location(namespace, key);
         self.client
             .delete_object()
-            .bucket(namespace)
-            .key(key)
+            .bucket(bucket)
+            .key(object_key)
             .send()
             .await
             .map_err(|err| s3_error("delete", namespace, key, &err))?;
@@ -225,11 +245,12 @@ impl ObjectStore for S3Store {
         prefix: &str,
         token: Option<String>,
     ) -> Result<(Vec<String>, Option<String>)> {
+        let (bucket, object_prefix) = self.location(namespace, prefix);
         let mut req = self
             .client
             .list_objects_v2()
-            .bucket(namespace)
-            .prefix(prefix);
+            .bucket(bucket)
+            .prefix(object_prefix);
         if let Some(token) = token {
             req = req.continuation_token(token);
         }
@@ -239,11 +260,23 @@ impl ObjectStore for S3Store {
             .await
             .map_err(|err| s3_error("list", namespace, prefix, &err))?;
 
+        // In fixed-bucket mode, returned keys carry the namespace prefix;
+        // strip it so callers always see namespace-relative keys.
+        let strip = self
+            .fixed_bucket
+            .as_ref()
+            .map(|_| format!("{namespace}/"))
+            .unwrap_or_default();
         let keys = output
             .contents
             .unwrap_or_default()
             .into_iter()
             .filter_map(|obj| obj.key)
+            .map(|key| {
+                key.strip_prefix(&strip)
+                    .map(ToString::to_string)
+                    .unwrap_or(key)
+            })
             .collect();
         let next_token = if output.is_truncated == Some(true) {
             output.next_continuation_token
@@ -254,6 +287,36 @@ impl ObjectStore for S3Store {
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>> {
+        // Fixed-bucket mode: namespaces are the top-level key prefixes.
+        if let Some(bucket) = &self.fixed_bucket {
+            let mut namespaces = Vec::new();
+            let mut token: Option<String> = None;
+            loop {
+                let mut req = self.client.list_objects_v2().bucket(bucket).delimiter("/");
+                if let Some(token) = token.take() {
+                    req = req.continuation_token(token);
+                }
+                let output = req
+                    .send()
+                    .await
+                    .map_err(|err| anyhow!("failed to list namespaces: {err:?}"))?;
+
+                namespaces.extend(
+                    output
+                        .common_prefixes()
+                        .iter()
+                        .filter_map(|p| p.prefix())
+                        .map(|p| p.trim_end_matches('/').to_string()),
+                );
+
+                if output.is_truncated == Some(true) {
+                    token = output.next_continuation_token;
+                } else {
+                    return Ok(namespaces);
+                }
+            }
+        }
+
         let output = self
             .client
             .list_buckets()
@@ -268,6 +331,12 @@ impl ObjectStore for S3Store {
     }
 
     async fn create_bucket(&self, namespace: &str) -> Result<()> {
+        // Fixed-bucket mode: the physical bucket is pre-provisioned and the
+        // namespace is only a key prefix, so there is nothing to create.
+        if self.fixed_bucket.is_some() {
+            return Ok(());
+        }
+
         match self.client.create_bucket().bucket(namespace).send().await {
             Ok(_) => {
                 tracing::info!("Created bucket: {}", namespace);

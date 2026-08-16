@@ -24,7 +24,7 @@ pub mod not_so_turbo_puffer {
     use moka::future::Cache;
     use tokio::sync::OnceCell;
 
-    pub use crate::engine::{DocumentId, Metadata, Namespace, Row};
+    pub use crate::engine::{DocumentId, Metadata, Namespace, Row, Schema};
     use crate::{
         ann::spfresh,
         compactor, config,
@@ -199,6 +199,14 @@ pub mod not_so_turbo_puffer {
 
         merged.approx_row_count = merged.approx_row_count.max(local.approx_row_count);
         merged.unindexed_bytes = merged.unindexed_bytes.max(local.unindexed_bytes);
+
+        // The local update is derived from an earlier remote state plus our
+        // intended changes; schema and dimensions carry the intent forward.
+        merged.schema = local.schema.clone();
+        if local.vector_dimensions.is_some() {
+            merged.vector_dimensions = local.vector_dimensions;
+        }
+
         merged.updated_at = chrono::Utc::now().timestamp();
         merged
     }
@@ -276,6 +284,10 @@ pub mod not_so_turbo_puffer {
             if count == 0 {
                 return Ok(0);
             }
+            let records_upserted = records
+                .iter()
+                .filter(|record| matches!(record, WalRecord::Upsert(_)))
+                .count() as u64;
 
             tracing::info!(
                 "Starting write: {} records for namespace: {}",
@@ -319,8 +331,10 @@ pub mod not_so_turbo_puffer {
                     format!("Failed to write batched WAL for namespace: {namespace}")
                 })?;
 
+            // Only upserts add rows; deletes and patches must not inflate the count.
+            let upsert_count = records_upserted;
             metadata.wal_files.push(wal_key.clone());
-            metadata.approx_row_count += count as u64;
+            metadata.approx_row_count += upsert_count;
             metadata.updated_at = chrono::Utc::now().timestamp();
             metadata.index.status = engine::IndexStatus::Updating;
 
@@ -399,7 +413,11 @@ pub mod not_so_turbo_puffer {
             let wal_fetch_duration = wal_fetch_start.elapsed();
 
             let wal_replay_start = Instant::now();
-            let (wal_state, deleted_ids) = engine::replay_wal_with_tombstones(&wal_chunks)?;
+            let engine::ReplayOutcome {
+                state: wal_state,
+                deleted_ids,
+                pending_patches,
+            } = engine::replay_wal_full(&wal_chunks)?;
             let wal_replay_duration = wal_replay_start.elapsed();
 
             // 4. ANN search over the indexed data
@@ -412,14 +430,22 @@ pub mod not_so_turbo_puffer {
                     .query_ann(&query_vector, top_k * 2, allowed_ids.as_ref())
                     .await?;
 
-                for (distance, row) in ann_results {
+                for (distance, mut row) in ann_results {
                     // Drop rows deleted by a newer WAL tombstone.
                     let deleted = deleted_ids
                         .get(&row.id)
                         .is_some_and(|del_ts| *del_ts > row.timestamp);
-                    if !deleted {
-                        index_candidates.push((distance, row));
+                    if deleted {
+                        continue;
                     }
+                    // Overlay WAL patches that target this indexed row.
+                    if let Some(patch) = pending_patches.get(&row.id)
+                        && patch.timestamp >= row.timestamp
+                    {
+                        row.attributes.extend(patch.attributes.clone());
+                        row.timestamp = patch.timestamp;
+                    }
+                    index_candidates.push((distance, row));
                 }
             }
             let ann_duration = ann_start.elapsed();
@@ -474,6 +500,17 @@ pub mod not_so_turbo_puffer {
             );
 
             Ok(results)
+        }
+
+        /// Replaces the namespace schema and persists it with compare-and-swap.
+        pub async fn update_schema(&self, namespace: &str, schema: Schema) -> Result<Metadata> {
+            let (mut metadata, etag) = self.get_metadata(namespace).await?;
+            metadata.schema = schema;
+            metadata.updated_at = chrono::Utc::now().timestamp();
+
+            invalidate_metadata_cache(namespace).await;
+            Self::persist_metadata(namespace, metadata.clone(), etag).await?;
+            Ok(metadata)
         }
 
         pub async fn get_metadata(&self, namespace: &str) -> Result<(Metadata, String)> {

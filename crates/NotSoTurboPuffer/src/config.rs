@@ -17,6 +17,12 @@ pub struct Config {
 pub struct ServerConfig {
     pub max_request_body_size: usize,
     pub request_timeout_ms: u64,
+    #[serde(default = "default_port")]
+    pub port: u16,
+}
+
+fn default_port() -> u16 {
+    3000
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +65,8 @@ pub struct StorageConfig {
     pub s3_region: String,
     #[serde(default = "default_local_cache_path")]
     pub local_cache_path: String,
+    #[serde(default)]
+    pub s3_bucket: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +115,15 @@ pub async fn get_config() -> Result<&'static Config> {
             }
             if let Ok(path) = std::env::var("LOCAL_CACHE_PATH") {
                 config.storage.local_cache_path = path;
+            }
+            if let Ok(bucket) = std::env::var("S3_BUCKET") {
+                config.storage.s3_bucket = Some(bucket);
+            }
+            // Deploy platforms (for example, Railway) inject the listen port.
+            if let Ok(port) = std::env::var("PORT")
+                && let Ok(port) = port.parse()
+            {
+                config.server.port = port;
             }
 
             Ok(config)

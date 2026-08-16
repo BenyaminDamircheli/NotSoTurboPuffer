@@ -1,0 +1,41 @@
+# NotSoTurboPuffer configuration.
+# Storage settings can be overridden by environment variables:
+# S3_ENDPOINT, S3_REGION, S3_BUCKET, LOCAL_CACHE_PATH, PORT.
+
+[server]
+max_request_body_size = 33554432 # 32 MiB
+request_timeout_ms = 30000
+port = 3000
+
+[limits]
+max_unindexed_wal_bytes = 268435456 # 256 MiB
+max_top_k = 1000
+max_vector_dimensions = 4096
+max_attribute_value_size = 65536
+max_document_size = 1048576
+max_rows_affected_by_patch_by_filter = 10000
+max_rows_affected_by_delete_by_filter = 10000
+max_concurrent_queries_per_namespace = 64
+
+[batching]
+max_batch_time_ms = 200
+max_batch_size = 500
+max_batch_bytes = 8388608 # 8 MiB
+
+[indexing]
+reindex_threshold_wal_count = 8
+reindex_threshold_row_count = 10000
+reindex_threshold_bytes = 33554432 # 32 MiB
+compaction_batch_size_bytes = 67108864 # 64 MiB
+cache_fill_concurrency = 8
+
+[storage]
+max_s3_connections = 32
+max_wal_write_retries = 5
+write_collision_retry_delay_ms = 50
+local_cache_path = "./data/cache"
+
+[compactor]
+sweeper_interval_secs = 60
+max_pending_requests = 256
+max_files_per_cycle = 32
