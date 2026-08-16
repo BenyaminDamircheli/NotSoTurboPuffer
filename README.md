@@ -16,15 +16,15 @@ compact: WAL batch -> SPFresh centroid index + inverted index -> one metadata CA
 
 These decisions shape the design:
 
-**Safety comes from S3 preconditions, not from locks.** The engine writes every WAL file with `if-none-match`. It replaces the per-namespace `metadata.json` only with `if-match` on its ETag. A writer that loses the race re-reads the remote state, re-applies its delta, and retries. There is no clock-sync assumption anywhere.
+**Safety comes from S3 preconditions** The engine writes every WAL file with `if-none-match`. It replaces the per-namespace `metadata.json` only with `if-match` on its ETag. A writer that loses the race re-reads the remote state, re-applies its delta, and retries.
 
-**One writer per namespace, by construction.** Concurrent writers on one namespace produce WAL collisions, so all writes for a namespace pass through a single in-process batcher. A request blocks until its batch is durable on S3. The response contains the real WAL key, not a fake ack.
+**One writer per namespace** Concurrent writers on one namespace produce WAL collisions, so all writes for a namespace pass through a single in-process batcher. A request blocks until its batch is durable on S3. The response contains the real WAL key.
 
-**The store is a stack of three layers.** `CachingStore<CountingStore<S3Store>>`: a write-through disk cache on top, a round-trip counter under it, raw S3 at the bottom. The order matters. The counter sits below the cache, so a cache hit never counts as a round trip. This makes "a cold query costs N round trips" a testable claim instead of a guess.
+**The store is a stack of three layers** `CachingStore<CountingStore<S3Store>>`: a write-through disk cache on top, a round-trip counter under it, raw S3 at the bottom. The order matters. The counter sits below the cache, so a cache hit never counts as a round trip.
 
-**The ANN index is SPFresh-style.** The compactor clusters vectors into postings and stores each posting as one S3 object. A query loads centroids, probes the `search_fanout` nearest postings, and scans those. Updates use delta operations and posting splits with LIRE reassignment instead of full rebuilds.
+**The ANN index is SPFresh-style** The compactor clusters vectors into postings and stores each posting as one S3 object. A query loads centroids, probes the `search_fanout` nearest postings, and scans those. Updates use delta operations and posting splits with LIRE reassignment instead of full rebuilds.
 
-**Deletes and patches survive compaction.** This is where most of the subtle bugs lived. Compaction deletes WAL files, so their tombstones must apply to both indexes first. Otherwise deleted documents reappear in results. The engine keeps patches that target indexed rows as "pending patches". The query path overlays them on index results immediately. The next compaction merges them into both indexes. The benchmark suite checks both behaviors end-to-end on every run.
+**Deletes and patches survive compaction** Compaction deletes WAL files, so their tombstones must apply to both indexes first. Otherwise deleted documents reappear in results. The engine keeps patches that target indexed rows as "pending patches". The query path overlays them on index results immediately. The next compaction merges them into both indexes. The benchmark suite checks both behaviors end-to-end on every run.
 
 ## Layout
 
